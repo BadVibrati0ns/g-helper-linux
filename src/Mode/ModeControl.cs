@@ -781,11 +781,20 @@ public class ModeControl
             ResetRyzen();
     }
 
-    /// <summary>Apply the current mode's saved cpu_uv value to the SMU.</summary>
+    /// <summary>
+    /// CPU temperature target goes through the SMU (RyzenSmu.SetTctlMax + guard)
+    /// only where ryzenadj cannot set tctl-temp (Dragon Range: "unsupported model").
+    /// Elsewhere the ryzenadj panel owns it.
+    /// </summary>
+    public static bool IsSmuCpuTemp
+        => App.Smu?.CanSetTctlMax == true && !Platform.Linux.RyzenPower.IsSupported("tctl-temp");
+
+    /// <summary>Apply the current mode's saved cpu_uv (and cpu_temp) values to the SMU.</summary>
     public void SetRyzen()
     {
         int cpuUV = Helpers.AppConfig.GetMode("cpu_uv", 0);
         SetUV(cpuUV);
+        SetCpuTemp(Helpers.AppConfig.GetMode("cpu_temp", Platform.Linux.RyzenSmu.MaxTctl));
         if (App.Smu?.IsIGpuSupported == true)
         {
             int igpuUV = Helpers.AppConfig.GetMode("igpu_uv", 0);
@@ -799,10 +808,15 @@ public class ModeControl
         }
     }
 
-    /// <summary>Reset CPU undervolt to 0 (stock voltage).</summary>
+    /// <summary>Reset CPU undervolt to 0 (stock voltage) and the temperature limit to stock.</summary>
     public void ResetRyzen()
     {
         SetUV(0);
+        if (App.Smu?.TctlGuardTarget != null)
+        {
+            App.Smu.StopTctlGuard();
+            Helpers.Logger.WriteLine("Ryzen temp: cpu_temp reset to stock");
+        }
         if (App.Smu?.IsIGpuSupported == true)
             App.Smu.SetIGpuCoAll(0);
     }
@@ -814,6 +828,23 @@ public class ModeControl
             Helpers.Logger.WriteLine($"Ryzen UV: cpu_uv={cpuUV} applied");
         else
             Helpers.Logger.WriteLine($"Ryzen UV: cpu_uv={cpuUV} apply FAILED");
+    }
+
+    /// <summary>Hold the CPU temperature limit via the SMU guard; stock (MaxTctl) stops it.</summary>
+    private static void SetCpuTemp(int cpuTemp)
+    {
+        if (!IsSmuCpuTemp)
+            return;
+        cpuTemp = Math.Clamp(cpuTemp, Platform.Linux.RyzenSmu.MinTctl, Platform.Linux.RyzenSmu.MaxTctl);
+        if (cpuTemp >= Platform.Linux.RyzenSmu.MaxTctl)
+        {
+            App.Smu!.StopTctlGuard();
+            return;
+        }
+        if (App.Smu!.StartTctlGuard(cpuTemp))
+            Helpers.Logger.WriteLine($"Ryzen temp: cpu_temp={cpuTemp} applied (guarded)");
+        else
+            Helpers.Logger.WriteLine($"Ryzen temp: cpu_temp={cpuTemp} apply FAILED");
     }
 
     /// <summary>

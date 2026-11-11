@@ -28,6 +28,10 @@ namespace GHelper.Linux.Platform.Linux;
 ///
 /// CO values are NOT persistent - they reset on every reboot.
 ///
+/// Tctl max (CPU temperature limit) uses RSMU SetTctlMax where verified (Raphael /
+/// Dragon Range, 0x59). The ASUS firmware rewrites the limit on its own, so
+/// StartTctlGuard re-asserts it from a 500 ms PM table poll until StopTctlGuard.
+///
 /// SAFETY:
 ///   - Startup validation: sends a read-only GetDldoPsmMargin before allowing writes
 ///   - Range clamped to [MinCPUUV, MaxCPUUV] (matches Windows CpuInfo.MinCPUUV/MaxCPUUV)
@@ -42,6 +46,9 @@ public sealed class RyzenSmu
     private const string SmuArgsPath = DriverPath + "/smu_args";
     private const string CodenamePath = DriverPath + "/codename";
     private const string VersionPath = DriverPath + "/version";
+    private const string PmTablePath = DriverPath + "/pm_table";
+    private const string PmTableSizePath = DriverPath + "/pm_table_size";
+    private const string PmTableVersionPath = DriverPath + "/pm_table_version";
 
     // SMU response codes (from ryzen_smu smu.h)
     private const uint SMU_RETURN_OK = 0x01;
@@ -56,6 +63,11 @@ public sealed class RyzenSmu
     public const int MinCPUUV = -40;
     public const int MaxCPUUV = 0;
 
+    // CPU temperature target bounds matching Windows RyzenControl.MinTemp / MaxTemp.
+    // MaxTctl is the stock limit: a target at MaxTctl means "no override".
+    public const int MinTctl = 75;
+    public const int MaxTctl = 98;
+
     /// <summary>
     /// RSMU command IDs for Curve Optimizer, per CPU generation.
     /// Verified from ZenStates-Core source (Zen3Settings.cs, Zen4Settings.cs, DragonRangeSettings.cs).
@@ -63,7 +75,8 @@ public sealed class RyzenSmu
     private record SmuCommandSet(
         uint SetAllCoreCO,    // SetAllDldoPsmMargin
         uint SetPerCoreCO,    // SetDldoPsmMargin
-        uint GetPerCoreCO     // GetDldoPsmMargin (read-only, used for validation)
+        uint GetPerCoreCO,    // GetDldoPsmMargin (read-only, used for validation)
+        uint? SetTctlMax = null // SetTctlMax (arg0 = degrees C); null = not verified for this CPU
     );
 
     // ryzen_smu codename IDs (from amkillam/ryzen_smu smu.h enum smu_processor_codename)
@@ -89,7 +102,9 @@ public sealed class RyzenSmu
         [CODENAME_REMBRANDT] = new(SetAllCoreCO: 0x0B, SetPerCoreCO: 0x0A, GetPerCoreCO: 0x7C),
 
         // Zen 4 RSMU - ZenStates-Core/SMUSettings/Zen4Settings.cs + DragonRangeSettings.cs (identical)
-        [CODENAME_RAPHAEL] = new(SetAllCoreCO: 0x07, SetPerCoreCO: 0x06, GetPerCoreCO: 0xD5),
+        // SetTctlMax 0x59 from Zen4Settings.cs (Rsmu.SMU_MSG_SetTctlMax), verified on Dragon Range
+        // (GX650PY). ryzenadj rejects this CPU, and Windows' MP1 0x3F needs root-only mp1_smu_cmd.
+        [CODENAME_RAPHAEL] = new(SetAllCoreCO: 0x07, SetPerCoreCO: 0x06, GetPerCoreCO: 0xD5, SetTctlMax: 0x59),
         [CODENAME_PHOENIX] = new(SetAllCoreCO: 0x07, SetPerCoreCO: 0x06, GetPerCoreCO: 0xD5),
         [CODENAME_HAWK_POINT] = new(SetAllCoreCO: 0x07, SetPerCoreCO: 0x06, GetPerCoreCO: 0xD5),
 
@@ -99,9 +114,27 @@ public sealed class RyzenSmu
         [CODENAME_STRIX_HALO] = new(SetAllCoreCO: 0x07, SetPerCoreCO: 0x06, GetPerCoreCO: 0xD5),
     };
 
+    // PM table layouts with a verified THM limit offset (float index). The
+    // read-back lets the Tctl guard rewrite only when the firmware has changed it.
+    private static readonly Dictionary<uint, int> PmTableThmLimitIndex = new()
+    {
+        [0x00540005] = 10, // Raphael/Dragon Range: [10] THM limit, [11] THM value (Tctl)
+    };
+
+    // Tctl guard: the ASUS firmware rewrites the THM limit on its own (98/92 C,
+    // ~17 s cycle on GX650PY), so a single SetTctlMax does not hold.
+    private const int TctlGuardIntervalMs = 500;
+    private const int TctlGuardBlindTicks = 4; // unknown PM table: rewrite every 2 s
+
     private SmuCommandSet? _commands;
     private int _codename = -1;
     private readonly object _smuLock = new();  // Defense-in-depth over kernel mutex
+    private readonly object _guardLock = new();
+    private Timer? _tctlGuard;
+    private int _tctlTarget;
+    private int _tctlGuardTicks;
+    private int _tctlReasserts;
+    private int? _tctlStock;
 
     /// <summary>Whether the driver is present, the CPU is supported, and validation passed.</summary>
     public bool IsAvailable { get; private set; }
@@ -111,6 +144,19 @@ public sealed class RyzenSmu
 
     /// <summary>ryzen_smu codename ID.</summary>
     public int Codename => _codename;
+
+    /// <summary>Whether the SMU can set the CPU temperature limit (SetTctlMax).</summary>
+    public bool CanSetTctlMax => IsAvailable && _commands?.SetTctlMax != null;
+
+    /// <summary>Target the Tctl guard is holding, or null when it is off.</summary>
+    public int? TctlGuardTarget
+    {
+        get
+        {
+            lock (_guardLock)
+                return _tctlGuard != null ? _tctlTarget : null;
+        }
+    }
 
     public RyzenSmu()
     {
@@ -173,8 +219,9 @@ public sealed class RyzenSmu
                 return;
             }
 
-            Helpers.Logger.WriteLine("RyzenSmu: validation passed, Curve Optimizer available");
             IsAvailable = true;
+            Helpers.Logger.WriteLine("RyzenSmu: validation passed, Curve Optimizer available" +
+                (CanSetTctlMax ? $", Tctl max available (PM table version 0x{ReadPmTableVersion() ?? 0:X8})" : ""));
         }
         catch (Exception ex)
         {
@@ -332,6 +379,153 @@ public sealed class RyzenSmu
     {
         Helpers.Logger.WriteLine("RyzenSmu: resetting all-core CO to 0");
         return SetCoAll(0);
+    }
+
+    /// <summary>
+    /// Set the CPU temperature limit (Tctl max) once. No-op on CPUs without a
+    /// verified SetTctlMax command. Use <see cref="StartTctlGuard"/> to hold it.
+    /// </summary>
+    /// <param name="celsius">Limit in degrees C, clamped to [MinTctl, MaxTctl].</param>
+    public bool SetTctlMax(int celsius)
+    {
+        if (!CanSetTctlMax)
+            return false;
+        celsius = Math.Clamp(celsius, MinTctl, MaxTctl);
+        bool ok = SendRsmuCommand(_commands!.SetTctlMax!.Value, (uint)celsius);
+        if (!ok)
+            Helpers.Logger.WriteLine($"RyzenSmu: SetTctlMax {celsius}C FAILED");
+        return ok;
+    }
+
+    /// <summary>
+    /// Read the current THM limit from the PM table. Null when the table is
+    /// unreadable or its layout is not verified.
+    /// </summary>
+    public float? GetTctlMax()
+    {
+        try
+        {
+            uint? version = ReadPmTableVersion();
+            if (version == null || !PmTableThmLimitIndex.TryGetValue(version.Value, out int index))
+                return null;
+            var sizeBytes = ReadSysfsBytes(PmTableSizePath, 8);
+            int size = sizeBytes.Length >= 8 ? (int)BitConverter.ToUInt64(sizeBytes, 0) : 0;
+            if (size < (index + 1) * 4)
+                return null;
+            var table = ReadSysfsBytes(PmTablePath, size);
+            if (table.Length < (index + 1) * 4)
+                return null;
+            return BitConverter.ToSingle(table, index * 4);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static uint? ReadPmTableVersion()
+    {
+        try
+        {
+            var bytes = ReadSysfsBytes(PmTableVersionPath, 4);
+            return bytes.Length < 4 ? null : BitConverter.ToUInt32(bytes, 0);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Hold the CPU temperature limit at <paramref name="celsius"/>: write it now,
+    /// then poll the PM table every 500 ms and rewrite when the firmware has
+    /// changed it. A target at MaxTctl (stock) stops the guard instead.
+    /// </summary>
+    public bool StartTctlGuard(int celsius)
+    {
+        if (!CanSetTctlMax)
+            return false;
+        celsius = Math.Clamp(celsius, MinTctl, MaxTctl);
+        if (celsius >= MaxTctl)
+        {
+            StopTctlGuard();
+            return true;
+        }
+
+        lock (_guardLock)
+        {
+            // Limit the firmware had before the first write; Stop restores it.
+            if (_tctlGuard == null)
+            {
+                float? stock = GetTctlMax();
+                _tctlStock = stock != null ? (int)Math.Round(stock.Value) : null;
+            }
+            bool ok = SetTctlMax(celsius);
+            float? readback = GetTctlMax();
+            Helpers.Logger.WriteLine($"RyzenSmu: Tctl guard {(_tctlGuard != null ? "retarget" : "start")} " +
+                $"{celsius}C (write {(ok ? "OK" : "FAILED")}, readback {(readback?.ToString("0.#") ?? "n/a")})");
+            _tctlTarget = celsius;
+            _tctlGuardTicks = 0;
+            _tctlReasserts = 0;
+            _tctlGuard ??= new Timer(_ => TctlGuardTick(), null, TctlGuardIntervalMs, TctlGuardIntervalMs);
+            return ok;
+        }
+    }
+
+    /// <summary>
+    /// Stop the Tctl guard and restore the limit read before it started
+    /// (MaxTctl when the PM table is unreadable). No-op when the guard is not running.
+    /// </summary>
+    public void StopTctlGuard()
+    {
+        lock (_guardLock)
+        {
+            if (_tctlGuard == null)
+                return;
+            _tctlGuard.Dispose();
+            _tctlGuard = null;
+            int restore = _tctlStock ?? MaxTctl;
+            bool ok = SetTctlMax(restore);
+            Helpers.Logger.WriteLine($"RyzenSmu: Tctl guard stop after {_tctlReasserts} re-assert(s), " +
+                $"restore {restore}C {(ok ? "OK" : "FAILED")}");
+        }
+    }
+
+    private void TctlGuardTick()
+    {
+        // TryEnter: a tick that overlaps a slow SMU call or a Stop just skips.
+        if (!Monitor.TryEnter(_guardLock))
+            return;
+        try
+        {
+            if (_tctlGuard == null)
+                return;
+            float? current = GetTctlMax();
+            if (current != null)
+            {
+                if (Math.Abs(current.Value - _tctlTarget) < 0.5f)
+                    return;
+            }
+            else if (++_tctlGuardTicks % TctlGuardBlindTicks != 0)
+            {
+                return;
+            }
+
+            bool ok = SetTctlMax(_tctlTarget);
+            _tctlReasserts++;
+            // Firmware rewrites every ~17 s: log the first and then every 20th.
+            if (_tctlReasserts % 20 == 1 || !ok)
+                Helpers.Logger.WriteLine($"RyzenSmu: Tctl guard re-assert {_tctlTarget}C " +
+                    $"(was {(current?.ToString("0.#") ?? "unknown")}, {(ok ? "OK" : "FAILED")}, count {_tctlReasserts})");
+        }
+        catch (Exception ex)
+        {
+            Helpers.Logger.WriteLine("RyzenSmu: Tctl guard tick failed", ex);
+        }
+        finally
+        {
+            Monitor.Exit(_guardLock);
+        }
     }
 
     public bool IsIGpuSupported => false;

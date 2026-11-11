@@ -4,6 +4,8 @@
 
 ### Added
 
+- AMD Dragon Range (Ryzen 7045HX, e.g. GX650PY): "CPU Temp Target" slider in Fans > Undervolting. ryzenadj does not support these CPUs, so the limit is set through the ryzen_smu driver (RSMU SetTctlMax). The ASUS firmware rewrites the limit every ~17 s, so G-Helper checks it every 0.5 s and sets it again. Saved per mode; applied with "Apply" or on mode switch when auto-apply is on; Reset or 98 C restores stock.
+
 ### Fixed
 
 ### Changed

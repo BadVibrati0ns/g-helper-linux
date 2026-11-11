@@ -1875,6 +1875,7 @@ public partial class FansWindow : Window
                 sliderCpuUV.Value = -mv;
                 labelCpuUV.Text = $"{mv} mV";
                 rowIgpuUV.IsVisible = false;
+                rowCpuTemp.IsVisible = false;
             }
             else
             {
@@ -1884,6 +1885,18 @@ public partial class FansWindow : Window
                 cpuUV = Math.Clamp(cpuUV, Platform.Linux.RyzenSmu.MinCPUUV, Platform.Linux.RyzenSmu.MaxCPUUV);
                 sliderCpuUV.Value = -cpuUV;
                 labelCpuUV.Text = cpuUV.ToString();
+
+                // CPU temp target (Windows trackTemp): SMU Tctl guard, per mode.
+                rowCpuTemp.IsVisible = Mode.ModeControl.IsSmuCpuTemp;
+                if (rowCpuTemp.IsVisible)
+                {
+                    sliderCpuTemp.Minimum = Platform.Linux.RyzenSmu.MinTctl;
+                    sliderCpuTemp.Maximum = Platform.Linux.RyzenSmu.MaxTctl;
+                    int cpuTemp = Helpers.AppConfig.GetMode("cpu_temp", Platform.Linux.RyzenSmu.MaxTctl);
+                    cpuTemp = Math.Clamp(cpuTemp, Platform.Linux.RyzenSmu.MinTctl, Platform.Linux.RyzenSmu.MaxTctl);
+                    sliderCpuTemp.Value = cpuTemp;
+                    labelCpuTemp.Text = $"{cpuTemp}\u00B0C";
+                }
 
                 rowIgpuUV.IsVisible = App.Smu?.IsIGpuSupported == true;
                 if (App.Smu?.IsIGpuSupported == true)
@@ -1932,12 +1945,19 @@ public partial class FansWindow : Window
         {
             sliderCpuUV.Value = 0;
             labelCpuUV.Text = intel ? "0 mV" : "0";
+            if (rowCpuTemp.IsVisible)
+            {
+                sliderCpuTemp.Value = Platform.Linux.RyzenSmu.MaxTctl;
+                labelCpuTemp.Text = $"{Platform.Linux.RyzenSmu.MaxTctl}\u00B0C";
+            }
         }
         finally
         {
             _updatingUV = false;
         }
         Helpers.AppConfig.SetMode(intel ? "cpu_uv_mv" : "cpu_uv", 0);
+        if (!intel)
+            Helpers.AppConfig.SetMode("cpu_temp", Platform.Linux.RyzenSmu.MaxTctl);
         App.Mode?.ResetCpuUndervolt();
     }
 
@@ -2307,6 +2327,8 @@ public partial class FansWindow : Window
     {
         if (_updatingUV)
             return;
-        labelCpuTemp.Text = $"{(int)e.NewValue}\u00B0C";
+        int cpuTemp = Math.Clamp((int)e.NewValue, Platform.Linux.RyzenSmu.MinTctl, Platform.Linux.RyzenSmu.MaxTctl);
+        labelCpuTemp.Text = $"{cpuTemp}\u00B0C";
+        Helpers.AppConfig.SetMode("cpu_temp", cpuTemp);
     }
 }

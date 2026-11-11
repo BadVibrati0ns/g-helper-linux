@@ -284,11 +284,11 @@
                                         <TextBlock Grid.Column="0" x:Name="labelCpuTempLabel" Text="CPU Temp Target"
                                                    Classes="label-dim" VerticalAlignment="Center" />
                                         <Slider Grid.Column="1" x:Name="sliderCpuTemp"
-                                                Minimum="75" Maximum="100" Value="100"
-                                                TickFrequency="1"
+                                                Minimum="75" Maximum="98" Value="98"
+                                                TickFrequency="1" IsSnapToTickEnabled="True"
                                                 ValueChanged="SliderCpuTemp_ValueChanged" />
                                         <TextBlock Grid.Column="2" x:Name="labelCpuTemp" Classes="value"
-                                                   Text="100°C" HorizontalAlignment="Center"
+                                                   Text="98°C" HorizontalAlignment="Center"
                                                    VerticalAlignment="Center" />
                                     </Grid>
 

@@ -1084,6 +1084,14 @@ public static class Diagnostics
         try
         {
             sb.Append(Platform.Linux.RyzenPower.DebugDump());
+            var smu = App.Smu;
+            if (smu?.CanSetTctlMax == true)
+            {
+                float? limit = smu.GetTctlMax();
+                sb.AppendLine($"  ryzen_smu Tctl max: limit={(limit?.ToString("0.#") ?? "n/a")} " +
+                    $"guard={(smu.TctlGuardTarget is int t ? $"{t}C" : "off")} " +
+                    $"cpu_temp(mode)={AppConfig.GetMode("cpu_temp")}");
+            }
         }
         catch (Exception ex)
         {
